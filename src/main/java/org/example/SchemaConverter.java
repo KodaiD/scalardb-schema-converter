@@ -1,8 +1,10 @@
 package org.example;
 
 import com.scalar.db.api.*;
+import com.scalar.db.exception.storage.ExecutionException;
 import com.scalar.db.exception.transaction.TransactionException;
 import com.scalar.db.io.Column;
+import com.scalar.db.io.DataType;
 import com.scalar.db.io.Key;
 import com.scalar.db.storage.cosmos.ConcatenationVisitor;
 import com.scalar.db.util.ScalarDbUtils;
@@ -40,6 +42,9 @@ public class SchemaConverter {
             "Table metadata not found for "
                 + ScalarDbUtils.getFullTableName(namespaceName, tableName));
       }
+
+      createMappingTableIfNotExists(namespaceName, metadata);
+      createArchiveTableIfNotExists(metadata);
 
       DistributedTransaction transaction = manager.start();
       String id = UUID.randomUUID().toString();
@@ -115,6 +120,52 @@ public class SchemaConverter {
       }
     } catch (Exception e) {
       throw new RuntimeException("Failed to archive data", e);
+    }
+  }
+
+  private void createMappingTableIfNotExists(
+      String originalNamespace, TableMetadata originalTableMetadata) {
+    try {
+      TableMetadata.Builder builder = TableMetadata.newBuilder();
+      for (String columnName : originalTableMetadata.getPartitionKeyNames()) {
+        DataType dataType = originalTableMetadata.getColumnDataType(columnName);
+        builder.addColumn(columnName, dataType).addPartitionKey(columnName);
+      }
+      for (String columnName : originalTableMetadata.getClusteringKeyNames()) {
+        DataType dataType = originalTableMetadata.getColumnDataType(columnName);
+        builder.addColumn(columnName, dataType).addClusteringKey(columnName);
+      }
+      builder.addColumn(MAPPING_TABLE_ID, DataType.TEXT).addPartitionKey(MAPPING_TABLE_ID);
+      admin.createTable(originalNamespace, MAPPING_TABLE_NAME, builder.build(), true);
+      System.out.println(
+          "Mapping table created: "
+              + ScalarDbUtils.getFullTableName(archiveNamespaceName, MAPPING_TABLE_NAME));
+    } catch (ExecutionException e) {
+      throw new RuntimeException("Failed to create mapping table", e);
+    }
+  }
+
+  private void createArchiveTableIfNotExists(TableMetadata originalTableMetadata) {
+    try {
+      TableMetadata.Builder builder =
+          TableMetadata.newBuilder()
+              .addColumn(ARCHIVE_TABLE_ID, DataType.TEXT)
+              .addColumn(ARCHIVE_TABLE_CONCATENATED_KEY, DataType.TEXT)
+              .addPartitionKey(ARCHIVE_TABLE_ID)
+              .addClusteringKey(ARCHIVE_TABLE_CONCATENATED_KEY);
+      for (String columnName : originalTableMetadata.getColumnNames()) {
+        if (!originalTableMetadata.getPartitionKeyNames().contains(columnName)
+            && !originalTableMetadata.getClusteringKeyNames().contains(columnName)) {
+          DataType dataType = originalTableMetadata.getColumnDataType(columnName);
+          builder.addColumn(columnName, dataType);
+        }
+      }
+      admin.createTable(archiveNamespaceName, ARCHIVE_TABLE_NAME, builder.build(), true);
+      System.out.println(
+          "Archive table created: "
+              + ScalarDbUtils.getFullTableName(archiveNamespaceName, ARCHIVE_TABLE_NAME));
+    } catch (ExecutionException e) {
+      throw new RuntimeException("Failed to create archive table", e);
     }
   }
 
