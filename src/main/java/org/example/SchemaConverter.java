@@ -9,19 +9,22 @@ import com.scalar.db.util.ScalarDbUtils;
 import java.util.*;
 
 public class SchemaConverter {
-  public static final String ARCHIVE_NAMESPACE = "archive";
   public static final String ARCHIVE_TABLE_NAME = "archive_data";
   public static final String ARCHIVE_TABLE_ID = "id";
   public static final String ARCHIVE_TABLE_CONCATENATED_KEY = "concatenated_key";
   public static final String MAPPING_TABLE_ID = "id";
   public static final String MAPPING_TABLE_NAME = "archive_mapping";
   public static final String SEPARATOR = ":";
+
   private final DistributedStorageAdmin admin;
   private final DistributedTransactionManager manager;
+  private final String archiveNamespaceName;
 
-  public SchemaConverter(DistributedStorageAdmin admin, DistributedTransactionManager manager) {
+  public SchemaConverter(
+      DistributedStorageAdmin admin, DistributedTransactionManager manager, String namespaceName) {
     this.admin = admin;
     this.manager = manager;
+    this.archiveNamespaceName = namespaceName;
   }
 
   public void store(Scan scan) {
@@ -34,21 +37,34 @@ public class SchemaConverter {
       TableMetadata metadata = admin.getTableMetadata(namespaceName, tableName);
       if (metadata == null) {
         throw new IllegalArgumentException(
-            "Table metadata not found for " + namespaceName + "." + tableName);
+            "Table metadata not found for "
+                + ScalarDbUtils.getFullTableName(namespaceName, tableName));
       }
+
       DistributedTransaction transaction = manager.start();
       String id = UUID.randomUUID().toString();
       // Read from the original table
       List<Result> results = transaction.scan(scan);
+      List<Insert> insertsForMappingTable = new ArrayList<>();
+      List<Insert> insertsForArchiveTable = new ArrayList<>();
+      List<Delete> deletesForOriginalTable = new ArrayList<>();
       for (Result result : results) {
         Key originalTablePartitionKey = ScalarDbUtils.getPartitionKey(result, metadata);
         Key originalTableClusteringKey =
             ScalarDbUtils.getClusteringKey(result, metadata).orElse(null);
 
         // Insert into the mapping table
-        transaction.insert(
-            prepareInsertForMappingTable(
-                originalTablePartitionKey, originalTableClusteringKey, id));
+        InsertBuilder.Buildable builderForMappingTable =
+            Insert.newBuilder()
+                .namespace(namespaceName)
+                .table(MAPPING_TABLE_NAME)
+                .partitionKey(originalTablePartitionKey);
+        if (originalTableClusteringKey != null) {
+          builderForMappingTable = builderForMappingTable.clusteringKey(originalTableClusteringKey);
+        }
+        Insert insertForMappingTable =
+            builderForMappingTable.textValue(MAPPING_TABLE_ID, id).build();
+        insertsForMappingTable.add(insertForMappingTable);
 
         // Insert into the archive table
         String concatenatedPartitionKey = getConcatenatedPartitionKey(scan, metadata);
@@ -57,89 +73,48 @@ public class SchemaConverter {
             concatenatedClusteringKey
                 .map(s -> concatenatedPartitionKey + SEPARATOR + s)
                 .orElse(concatenatedPartitionKey);
-        transaction.insert(
-            prepareInsertForArchiveTable(
-                Key.ofText(ARCHIVE_TABLE_ID, id),
-                Key.ofText(ARCHIVE_TABLE_CONCATENATED_KEY, concatenatedKey),
-                result,
-                metadata));
+        InsertBuilder.Buildable builderForArchiveTable =
+            Insert.newBuilder()
+                .namespace(archiveNamespaceName)
+                .table(ARCHIVE_TABLE_NAME)
+                .partitionKey(Key.ofText(ARCHIVE_TABLE_ID, id))
+                .clusteringKey(Key.ofText(ARCHIVE_TABLE_CONCATENATED_KEY, concatenatedKey));
+        for (Map.Entry<String, Column<?>> entry : result.getColumns().entrySet()) {
+          String columnName = entry.getKey();
+          Column<?> column = entry.getValue();
+          if (!metadata.getPartitionKeyNames().contains(columnName)
+              && !metadata.getClusteringKeyNames().contains(columnName)) {
+            // Only include non-key columns
+            builderForArchiveTable = builderForArchiveTable.value(column);
+          }
+        }
+        Insert insertForArchiveTable = builderForArchiveTable.build();
+        insertsForArchiveTable.add(insertForArchiveTable);
 
         // Delete from the original table
-        transaction.delete(
-            prepareDeleteForOriginalTable(
-                namespaceName, tableName, originalTablePartitionKey, originalTableClusteringKey));
-
-        // Commit the transaction
-        try {
-          transaction.commit();
-        } catch (TransactionException e) {
-          transaction.rollback();
-          throw e;
+        DeleteBuilder.Buildable deleteBuilder =
+            Delete.newBuilder()
+                .namespace(namespaceName)
+                .table(tableName)
+                .partitionKey(originalTablePartitionKey);
+        if (originalTableClusteringKey != null) {
+          deleteBuilder = deleteBuilder.clusteringKey(originalTableClusteringKey);
         }
+        Delete deleteForOriginalTable = deleteBuilder.build();
+        deletesForOriginalTable.add(deleteForOriginalTable);
+      }
+
+      try {
+        transaction.mutate(insertsForMappingTable);
+        transaction.mutate(insertsForArchiveTable);
+        transaction.mutate(deletesForOriginalTable);
+        transaction.commit();
+      } catch (TransactionException e) {
+        transaction.rollback();
+        throw e;
       }
     } catch (Exception e) {
       throw new RuntimeException("Failed to archive data", e);
-    }
-  }
-
-  private Insert prepareInsertForMappingTable(Key partitionKey, Key clusteringKey, String id) {
-    if (clusteringKey != null) {
-      return Insert.newBuilder()
-          .namespace(ARCHIVE_NAMESPACE)
-          .table(MAPPING_TABLE_NAME)
-          .partitionKey(partitionKey)
-          .clusteringKey(clusteringKey)
-          .textValue(MAPPING_TABLE_ID, id)
-          .build();
-    } else {
-      return Insert.newBuilder()
-          .namespace(ARCHIVE_NAMESPACE)
-          .table(MAPPING_TABLE_NAME)
-          .partitionKey(partitionKey)
-          .textValue(MAPPING_TABLE_ID, id)
-          .build();
-    }
-  }
-
-  private Insert prepareInsertForArchiveTable(
-      Key partitionKey, Key clusteringKey, Result result, TableMetadata metadata) {
-    if (clusteringKey == null) {
-      throw new IllegalArgumentException(
-          "Clustering key must not be null for archive table: " + ARCHIVE_TABLE_NAME);
-    }
-    InsertBuilder.Buildable buildable =
-        Insert.newBuilder()
-            .namespace(ARCHIVE_NAMESPACE)
-            .table(ARCHIVE_TABLE_NAME)
-            .partitionKey(partitionKey)
-            .clusteringKey(clusteringKey);
-    for (Map.Entry<String, Column<?>> entry : result.getColumns().entrySet()) {
-      String columnName = entry.getKey();
-      Column<?> column = entry.getValue();
-      if (!metadata.getPartitionKeyNames().contains(columnName)
-          && !metadata.getClusteringKeyNames().contains(columnName)) {
-        // Only include non-key columns
-        buildable = buildable.value(column);
-      }
-    }
-    return buildable.build();
-  }
-
-  private Delete prepareDeleteForOriginalTable(
-      String namespaceName, String tableName, Key partitionKey, Key clusteringKey) {
-    if (clusteringKey != null) {
-      return Delete.newBuilder()
-          .namespace(namespaceName)
-          .table(tableName)
-          .partitionKey(partitionKey)
-          .clusteringKey(clusteringKey)
-          .build();
-    } else {
-      return Delete.newBuilder()
-          .namespace(namespaceName)
-          .table(tableName)
-          .partitionKey(clusteringKey)
-          .build();
     }
   }
 
