@@ -9,6 +9,7 @@ import com.scalar.db.io.Key;
 import com.scalar.db.storage.cosmos.ConcatenationVisitor;
 import com.scalar.db.util.ScalarDbUtils;
 import java.util.*;
+import java.util.function.BiFunction;
 
 public class SchemaConverter {
   public static final String ARCHIVE_TABLE_NAME = "archive_data";
@@ -21,12 +22,25 @@ public class SchemaConverter {
   private final DistributedStorageAdmin admin;
   private final DistributedTransactionManager manager;
   private final String archiveNamespaceName;
+  private final BiFunction<Key, Key, Object> mapper;
 
   public SchemaConverter(
       DistributedStorageAdmin admin, DistributedTransactionManager manager, String namespaceName) {
     this.admin = admin;
     this.manager = manager;
     this.archiveNamespaceName = namespaceName;
+    this.mapper = (originalPartitionKey, originalClusteringKey) -> UUID.randomUUID().toString();
+  }
+
+  public SchemaConverter(
+      DistributedStorageAdmin admin,
+      DistributedTransactionManager manager,
+      String namespaceName,
+      BiFunction<Key, Key, Object> mapper) {
+    this.admin = admin;
+    this.manager = manager;
+    this.archiveNamespaceName = namespaceName;
+    this.mapper = mapper;
   }
 
   public void store(Scan scan) {
@@ -47,7 +61,7 @@ public class SchemaConverter {
       createArchiveTableIfNotExists(metadata);
 
       DistributedTransaction transaction = manager.start();
-      String id = UUID.randomUUID().toString();
+
       // Read from the original table
       List<Result> results = transaction.scan(scan);
       List<Insert> insertsForMappingTable = new ArrayList<>();
@@ -57,6 +71,8 @@ public class SchemaConverter {
         Key originalTablePartitionKey = ScalarDbUtils.getPartitionKey(result, metadata);
         Key originalTableClusteringKey =
             ScalarDbUtils.getClusteringKey(result, metadata).orElse(null);
+        String idKeyValue =
+            (String) mapper.apply(originalTablePartitionKey, originalTableClusteringKey);
 
         // Insert into the mapping table
         InsertBuilder.Buildable builderForMappingTable =
@@ -68,7 +84,7 @@ public class SchemaConverter {
           builderForMappingTable = builderForMappingTable.clusteringKey(originalTableClusteringKey);
         }
         Insert insertForMappingTable =
-            builderForMappingTable.textValue(MAPPING_TABLE_ID, id).build();
+            builderForMappingTable.textValue(MAPPING_TABLE_ID, idKeyValue).build();
         insertsForMappingTable.add(insertForMappingTable);
 
         // Insert into the archive table
@@ -82,7 +98,7 @@ public class SchemaConverter {
             Insert.newBuilder()
                 .namespace(archiveNamespaceName)
                 .table(ARCHIVE_TABLE_NAME)
-                .partitionKey(Key.ofText(ARCHIVE_TABLE_ID, id))
+                .partitionKey(Key.ofText(ARCHIVE_TABLE_ID, idKeyValue))
                 .clusteringKey(Key.ofText(ARCHIVE_TABLE_CONCATENATED_KEY, concatenatedKey));
         for (Map.Entry<String, Column<?>> entry : result.getColumns().entrySet()) {
           String columnName = entry.getKey();
